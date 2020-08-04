@@ -1,0 +1,158 @@
+---
+title: "Trying to break our statistics on graphs"
+author: "Joel Eliason"
+date: "8/3/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+packages <- c("igraph", "tidyverse", "container")
+lapply(packages, library, character.only = TRUE)
+```
+
+Here we are going to be looking at trying to find the weak spots in using vanilla statistical tests on graph properties!
+Criticism is fun.
+
+First we need a model or graph generation process, that will allow us to change parameters and thus view the effects on power and testing.
+
+Let's grab all the distances in the distances files, as we will need those for the simple models that are used next:
+
+```{r}
+filepath = '~/Data/ADHD_200/'
+subject_ids = read.csv(paste0(filepath,'ids_in_order.txt'), header = F)
+
+region_full = lapply(subject_ids[,1], function(subject_id) {
+  region_names <- read.csv(paste0(filepath,'ADHD200_CC200/',subject_id,'_region_names_full_file.txt'), sep = ' ', header = F)
+})
+
+allSame <- function(x) length(unique(x)) == 1
+allSame(region_full)
+
+import.distance.matrix <- function(subject_id) {
+  matrix <- read.csv(paste0(filepath,'ADHD200_CC200/',subject_id,'_region_xyz_centers_file.txt'), sep = ' ', header = F)
+  region_names <- read.csv(paste0(filepath,'ADHD200_CC200/',subject_id,'_region_names_abbrev_file.txt'), sep=',', header = F)
+  region_names$V1 <- sub('[.]', '_', make.names(region_names$V1, unique=TRUE)) # some regions have identical names, this is to make each row unique
+  return(list(subject_id=subject_id,X=as_tibble(cbind(region=region_names$V1,coord=matrix$V1)), Y=as_tibble(cbind(coord=matrix$V2)), Z=as_tibble(cbind(coord=matrix$V3))))
+}
+
+distances <- lapply(as.list(subject_ids[,1]), import.distance.matrix) %>%
+  transpose() %>%
+  as_tibble() %>%
+  mutate(subject_id = map_chr(subject_id, 1))
+
+distances <- distances %>%
+  unnest(cols=c(X,Y,Z), names_sep='_') %>%
+  rename(region=X_region) %>%
+  mutate(X_coord=as.numeric(X_coord)) %>%
+  mutate(region=factor(region))
+
+d <- distances %>%
+  group_by(region) %>%
+  summarize(n_distinct(Z_coord))
+
+# Checking each of the coordinates, we can see that we have identical (X,y,z) coordinates for each region, so we'll just pick one at random
+
+d <- distances %>% 
+ filter(subject_id=='KKI_2371032') %>%
+ full_join(.,., by="subject_id") %>%
+ filter(region.x != region.y) %>%
+ rowwise() %>%
+ mutate(group=paste(c(as.character(region.x), as.character(region.y)), collapse="-")) %>%
+ mutate(dist = sqrt((X_coord.x - X_coord.y)^2 + (Y_coord.x - Y_coord.y)^2 + (Z_coord.x - Z_coord.y)^2))
+
+ # mutate(group=paste(sort(c(as.character(region.x), as.character(region.y))), collapse="-")) %>% # these two lines took forever to figure out
+ # distinct(group, .keep_all = T) %>%
+ 
+
+d %>%
+  ggplot(aes(x = dist)) +
+  geom_histogram(color ="transparent", fill="grey67") +
+  xlab('Distance') +
+  ggtitle('Distance distribution')
+
+```
+
+Now let's get some of those network generation algorithms unpacked.  In particular, I'll be using:
+
+* lattice
+* random (Erdos-Renyi)
+* preferential attachment
+* economical preferential attachment
+* economical exponential decay
+* economical clustering
+... and probably some others on top of that as well.
+
+```{r}
+# Economical preferential attachment
+
+dist.mat <- d %>%
+  pivot_wider(id_cols = region.x, names_from = region.y, values_from = dist) %>%
+  relocate(BS, .after=region.x) %>%
+  select(-region.x) %>%
+  as.matrix()
+
+diag(dist.mat)
+dist.mat[lower.tri(dist.mat,diag=TRUE)] <- 0
+
+eta <- 5.37
+dist.mat <- dist.mat^eta
+
+Nv <- 190
+regions <- d$dist
+names(regions) <- d$group
+dict_regions <- Dict$new(regions)
+
+sample_econ_pa <- function() {
+  tic("sampling")
+  sample_graph <- graph.empty(n = Nv, directed = F)
+  V(sample_graph)$region <- "None"
+  gamma <- 1.81
+  get_distance <- function(existing_node, new_node) {
+    # existing_node <- V(sample_graph)[existing_node_idx]$region
+    # new_node <- V(sample_graph)[new_node_idx]$region
+    dist <- dict_regions$peek(paste(new_node, existing_node, sep = '-'))
+  }
+  normalizing_constant <- function(existing_nodes, new_node) {
+    # print(existing_nodes)
+    # print(new_node_idx)
+    if(!is_empty(existing_nodes)) {
+      tic("distances")
+      dists <- sapply(existing_nodes$region, get_distance, new_node = new_node)
+      toc()
+      tic("degrees")
+      degrees <- sapply(existing_nodes, degree, g = sample_graph) + 1
+      toc()
+      tic("remainder of calculation")
+      probs <- (degrees^gamma)*(dists^eta)
+      p <- sum(probs)
+      toc()
+      p
+    } else {
+      1
+    }
+  }
+  calculate_unnormalized_prob <- function(new_node_idx, existing_nodes) {
+    degrees <- unlist(sapply(existing_nodes, degree, g = sample_graph)) + 1
+    p <- (degrees)^gamma*(dist.mat[1:new_node_idx-1,new_node_idx])
+  }
+  for(new_node_idx in seq_along(colnames(dist.mat))) {
+    new_node <- colnames(dist.mat)[[new_node_idx]]
+    existing_nodes <- V(sample_graph)[1:new_node_idx-1]
+    V(sample_graph)[new_node_idx]$region <- new_node
+    if(!is_empty(existing_nodes)) {
+      probs <- calculate_unnormalized_prob(new_node_idx, existing_nodes)
+      probs <- probs / sum(probs)
+      to.add <- unlist(sapply(1:length(probs), function(existing_node_idx) {
+        if(rbinom(1,1,probs[existing_node_idx])) c(new_node_idx, existing_node_idx)
+      }))
+      sample_graph <- add_edges(sample_graph,to.add)
+    }
+  }
+  toc()
+  return(sample_graph)
+}
+
+g <- sample_econ_pa()
+```
+

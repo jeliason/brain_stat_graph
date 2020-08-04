@@ -1,0 +1,61 @@
+---
+title: "How does binarizing weighted networks change network characteristics?"
+author: "Joel Eliason"
+date: "7/5/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+packages <- c("igraph", "R.matlab", "ggplot2", "reshape2")
+lapply(packages, library, character.only = TRUE)
+options(scipen = 999)
+```
+
+Here we'll be examining how different network metrics (as seen [here](./bct_table.pdf)) change as we binarize a weighted undirected network.
+The network we will be examining here is a network of functional whole-brain coactivations, as measured with fMRI.
+
+First, we parse the data from a .mat file into a dataframe. Then we'll take a look at different thresholds.
+
+```{r}
+df <- readMat("Coactivation_matrix.mat")
+
+nnodes <- dim(df$Coactivation.matrix)[1]
+nlinks <- sum(df$Coactivation.matrix != 0) / 2 # Here we divide by 2 since the matrix is symmetric
+```
+We can see that there are `r nnodes` nodes and `r nlinks` links in the weighted network.
+
+Next, we'll convert it to an `igraph` object and start to look at thresholding.
+
+```{r}
+graph <- graph_from_adjacency_matrix(df$Coactivation.matrix, weighted = T, mode = "undirected", diag = F)
+```
+
+### Degree
+We'll start by looking at how a very simple characteristic, the *degree distribution*, changes with threshold:
+
+```{r, warning=FALSE, message=FALSE}
+thresholds <- c(0.01,0.05,0.1)
+binarize <- function(threshold, matrix) {
+  bin.graph <- graph_from_adjacency_matrix(matrix > threshold, mode = "lower", diag = F)
+  degrees <- degree(bin.graph)
+  df <- data.frame(degrees)
+  colnames(df) <- c(paste("Binarized at threshold = ", threshold))
+  return(df)
+}
+
+bin.dfs <- lapply(thresholds, binarize, matrix=df$Coactivation.matrix)
+
+degrees <- degree(graph)
+df <- data.frame(degrees)
+colnames(df) <- c("Original")
+
+
+
+ggplot(melt(cbind(df, do.call(cbind, bin.dfs)), value.name = "Degree"), aes(Degree)) + 
+  geom_histogram(aes(y=..density..), bins=30,
+                 color="black", fill="white") +
+  geom_density(alpha=.2, fill="#FF6666") + 
+  facet_wrap(.~variable, scales="free")
+```
+

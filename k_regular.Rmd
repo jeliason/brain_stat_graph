@@ -1,0 +1,74 @@
+---
+title: "k-regular graphs"
+author: "Joel Eliason"
+date: "7/3/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+packages <- c("igraph", "network", "sna")
+lapply(packages, library, character.only = TRUE)
+```
+This work is intended to explore the relationship between several rather simple
+network characteristics and the size (number of vertices) of graphs that are
+randomly generated as *k-regular* graphs, that is, graphs in which each vertex has
+*k* neighbors. For example, as a first experiment, I will be examining if and how
+the distribution of the measure of average *closeness centrality* of a network will 
+change as I vary the size of the graph.
+
+Of course, an important point is that this work is intentionally very exploratory,
+so the opportunity to go down rabbit holes will be continually present.
+
+Here we can see an example of a *k-regular* graph:
+
+```{r}
+g <- k.regular.game(20, 4)
+
+l <- layout.kamada.kawai(g)
+plot(g, layout=l)
+```
+
+As a first pass, let's take a look at a couple histograms of the average closeness
+of the graph for a couple different network sizes, but with *k* fixed.
+```{r, cache=TRUE}
+N = 20
+k = 4
+m = 10000
+set.seed(1)
+hist.closeness <- function (N, m, k) {
+  graphs <- replicate(m, igraph::k.regular.game(N, k), simplify = FALSE)
+
+
+  close <- lapply(graphs, igraph::closeness, normalized = TRUE)
+  close.mean <- unlist(lapply(close, mean))
+  hist(close.mean, col="lightblue", xlim=c(min(close.mean),max(close.mean)),
+       xlab=paste("Mean closeness, N = ", N), ylab="Frequency", main="", breaks = 30)
+}
+
+par(mfrow=c(1,3))
+hist.closeness(N, m, k)
+
+N = 50
+hist.closeness(N, m, k)
+
+N = 100
+hist.closeness(N, m, k)
+
+```
+
+Let's examine some of these centralities using target plots:
+```{r, warning=FALSE}
+N = 20
+graph <- igraph::k.regular.game(N, k)
+A <- igraph::get.adjacency(graph, sparse=FALSE)
+g <- network::as.network.matrix(A)
+sna::gplot.target(g, closeness(g), main="Closeness",
+                  circ.lab = FALSE,
+circ.col="skyblue",
+usearrows = FALSE,
+vertex.col="blue",
+edge.col="darkgray")
+```
+
+

@@ -1,0 +1,328 @@
+---
+title: "Thresholding and its impact on graph properties in the ADHD 200 dataset"
+author: "Joel Eliason"
+date: "7/8/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,  fig.width=13, fig.height=6)
+packages <- c("igraph", "tidyverse", "brms",  "magrittr", "lmPerm", "coin")
+lapply(packages, library, character.only = TRUE)
+```
+
+In this report, I'll be looking at significant differences in graph properties between healthy and ADHD functional networks.
+
+To start off, let's import the data and separate it into groups.
+
+Data was imported from http://umcd.humanconnectomeproject.org/get_study_data/ADHD200_CC200.
+
+```{r, cache=TRUE}
+filepath = '~/Data/ADHD_200/'
+N = 520
+columns = c("Subject_ID","Age", "Gender", "Label")
+subject_metadata = data.frame(matrix(nrow=520,ncol=length(columns)))
+colnames(subject_metadata) <- columns
+subject_ids = read.csv(paste0(filepath,'ids_in_order.txt'), header = F)
+ages = read.csv(paste0(filepath,'ADHD200_CC200/','ages_list.txt'), header = F)
+genders = read.csv(paste0(filepath,'ADHD200_CC200/','genders_list.txt'), header = F)
+labels = read.csv(paste0(filepath,'ADHD200_CC200/','subject_labels_list.txt'), header = F)
+
+
+for (index in 1:N) {
+  subject_metadata[index,"Subject_ID"] = subject_ids[index,]
+  subject_metadata[index,"Age"] = ages[index,]
+  subject_metadata[index,"Gender"] = genders[index,]
+  subject_metadata[index,"Label"] = labels[index,]
+}
+
+import.connectivity.matrix <- function(subject_id) {
+  matrix <- as.matrix(read.csv(paste0(filepath,'ADHD200_CC200/',subject_id,'_connectivity_matrix_file.txt'), sep = ' ', header = F))
+  return(list(subject_id=subject_id,connectivity_matrix=matrix))
+}
+
+data <- lapply(as.list(subject_ids[,1]), import.connectivity.matrix)
+
+healthy_ids = subject_metadata[subject_metadata["Label"] == "Typically Developing",]["Subject_ID"]
+adhd_ids = subject_metadata[subject_metadata["Label"] != "Typically Developing",]["Subject_ID"]
+
+
+```
+
+We should also check the symmetricity of the matrices:
+
+```{r}
+symm <- lapply(data, function(x) isSymmetric(x$connectivity_matrix, check.attributes = F))
+sum(unlist(symm))
+```
+
+Looks like all of these matrices are symmetric, so we can consider each of them as a weighted undirected graph.
+
+Next we'll find the connectivity strength (the average of all pairwise correlations) per subject, as well as the regional connectivity strength (per region per subject) and the regional diversity of connections (variance of strength between one region and all other regions). We will append each of these measures to the list it pertains to.
+
+```{r}
+regional.diversity <- function(matrix) {
+  # this just calculates variance of each row
+  return(rowSums((matrix-rowMeans(matrix))^2)/(dim(matrix)[2]-1))
+}
+connectivity.strength <- function(matrix) {
+  return(mean(matrix))
+}
+connectivity.diversity <- function(matrix) {
+  return(mean(regional.diversity(matrix)))
+}
+get.properties <- function(mlist) {
+  matrix <- mlist$connectivity_matrix
+  sz = dim(matrix)[[1]]
+  mlist[["connectivity_strength"]] = connectivity.strength(matrix)
+  mlist[["regional_strength"]] = rowMeans(matrix)*sz/(sz-1)
+  mlist[["regional_diversity"]] = regional.diversity(matrix)
+  mlist[["connectivity_diversity"]] = connectivity.diversity(matrix)
+  
+  # graph <- graph_from_adjacency_matrix(matrix, weighted = T, mode = "undirected")
+  # mlist[["degree"]] = degree(graph)
+  # mlist[["degree_distribution"]] = degree_distribution(graph)
+  
+  return(mlist)
+}
+
+y <- data[1:100]
+
+y <- lapply(y, get.properties)
+
+data.with.props <- lapply(data, get.properties)
+
+healthy_data = Filter(function(x){is.element(x$subject_id, unlist(healthy_ids))},data.with.props)
+adhd_data = Filter(function(x){is.element(x$subject_id, unlist(adhd_ids))},data.with.props)
+
+props.to.test <- c("connectivity_strength", "connectivity_diversity")
+group_tests <- sapply(props.to.test, function(prop) {
+  t.test(unlist(lapply(healthy_data,function(x) x[[prop]])), unlist(lapply(adhd_data,function(x) x[[prop]])))
+  }, USE.NAMES = T, simplify = F)
+group_tests
+```
+
+Here we can see that neither the connectivity strength or connectivity diversity have a statistically significant difference between the two groups,
+at least according to a naive use of a t-test, without looking at whether our data meets the assumptions of a t-test or adjusting for multiple comparisons.
+We'll get to these slightly more nuanced statistical questions later on in this report - for now, we will be examining the impact that different thresholding
+techniques have on these two graph characteristics.
+
+
+### Thresholding, part 1: One simple thresholding technique, applied to two graph characteristics
+
+Let's take a look at the most common thresholding technique.
+
+Consider that many graph properties are strongly dependent on *N*, the number of nodes, as well as the connection density $\kappa$, $0 < \kappa <1$ (and, 
+closely related, the degree distribution). Setting a constant threshold across graphs will change *N* and $\kappa$ differently in different graphs. It then becomes
+much harder to rely on the results of comparisons between graphs when such fundamental quantities are not maintained. Since here all graphs have the same number of nodes,
+we will turn our attention to maintaining $\kappa$ while thresholding; in particular, we will try to maintain $\kappa$ , $0.37 \leq \kappa \leq 0.5$. For each value in that range (at increments of 0.01), we will
+take a measurement of the graph properties and plot a density curve of various graph properties (or what I will more simply call a density curve).
+
+Statistical significance testing at this point becomes somewhat more difficult, due to the multiple comparisons problem between different points on the density curve not necessarily
+being well-defined (and is a possible future research direction!). We can also use the AUC of the curve and test for significance - however, we obviously lose the structure in the density curve
+and its implications for significance.
+
+Let's take a look at this thresholding technique and its impact on connectivity strength and diversity:
+
+```{r, cache=TRUE}
+dens.to.eval <- seq(0.37, 0.5, 0.01)
+find.density.curves <- function(mlist) {
+  matrix <- mlist$connectivity_matrix
+  sorted.values <- sort(abs(unique(c(matrix))))
+  sorted.values <- sorted.values[seq(1, length(sorted.values), 100)]
+  
+  densities <- sapply(sorted.values, function(threshold) {
+      bin.graph <- graph_from_adjacency_matrix(abs(matrix) > threshold, mode = "lower", diag = F)
+      return(edge_density(bin.graph))
+  }, simplify = T)
+  mlist[["connectivity_strength_dcurve"]] <- lapply(dens.to.eval, function(density) {
+    threshold <- sort(sorted.values[which(densities > density)], decreasing = T)[1]
+    temp <- matrix
+    temp[abs(temp) < threshold] <- 0.0
+    return(connectivity.strength(temp))
+  })
+  mlist[["connectivity_diversity_dcurve"]] <- lapply(dens.to.eval, function(density) {
+    threshold <- sort(sorted.values[which(densities > density)], decreasing = T)[1]
+    temp <- matrix
+    temp[abs(temp) < threshold] <- 0.0
+    return(connectivity.diversity(temp))
+  })
+  return(mlist)
+}
+
+y.with.density.curves <- lapply(y, find.density.curves)
+data.with.density.curves <- lapply(data.with.props, find.density.curves)
+```
+
+As an example of what these density curves would look like, we can take a look at the
+first and second matrices, which are healthy and ADHD subjects respectively. We'll then
+approach the issue of doing statistical testing using these curves later on.
+
+(Should probably start using ggplot more)
+```{r}
+par(mfrow=c(2,2))
+plot(dens.to.eval, y.with.density.curves[[1]]$connectivity_strength_dcurve,
+     main="Connectivity Strength - Healthy",
+     xlab = "Density",
+     ylab = "Connectivity Strength",
+     col = "red")
+plot(dens.to.eval, y.with.density.curves[[1]]$connectivity_diversity_dcurve,
+     main="Connectivity Diversity - Healthy",
+     xlab = "Density",
+     ylab = "Connectivity Diversity",
+     col = "blue")
+
+plot(dens.to.eval, y.with.density.curves[[5]]$connectivity_strength_dcurve,
+     main="Connectivity Strength - ADHD",
+     xlab = "Density",
+     ylab = "Connectivity Strength",
+     col = "red")
+plot(dens.to.eval, y.with.density.curves[[5]]$connectivity_diversity_dcurve,
+     main="Connectivity Diversity - ADHD",
+     xlab = "Density",
+     ylab = "Connectivity Diversity",
+     col = "blue")
+```
+
+Some striking differences to note in connectivity strength between healthy and ADHD, at least in these two subjects!
+
+### Bayesian hypothesis testing using `brms`
+
+A solution to hypothesis testing that is more robust to multiple comparisons (and, of course, to experimenters' intentions) 
+is Bayesian modeling of graph properties. Here, we will be modeling the graph properties explicitly (ie, calculating them and
+then modeling them), though it's possible a more implicit graph representation type modeling approach is possible as well (some
+deep learning methods maybe take this approach?). Here, though, the intention is just to get more familiar with Bayesian modeling using `brms` 
+and then applying various Bayesian hypothesis testing methods (which are naturally more robust and explicit about assumptions). I'll be attempting greater use of
+the`tidyverse` as well.
+
+```{r}
+d <- data.with.density.curves %>%
+  transpose() %>% # turns a list of lists inside out - if you have list of length n where each component had values a and b, transpose() makes a list with elements a and b that contain lists of length n
+  as_tibble() %>%
+  mutate(subject_id = map_chr(subject_id, 1)) %>%
+  mutate(connectivity_diversity = map_dbl(connectivity_diversity, 1)) %>%
+  mutate(connectivity_strength = map_dbl(connectivity_strength, 1)) %>%
+  mutate(connectivity_matrix = map(connectivity_matrix, ~as_tibble(t(.x)))) %>%
+  mutate(connectivity_matrix = map(connectivity_matrix, ~set_names(.x, paste0("V", seq_len(190))))) %>%
+  # mutate(connectivity_matrix = pluck(connectivity_matrix, 1)) %>%
+  mutate("Connectivity Strength Per Density" = map(connectivity_strength_dcurve, ~flatten_dbl(.x))) %>%
+  mutate("Connectivity Diversity Per Density" = map(connectivity_diversity_dcurve, ~flatten_dbl(.x))) %>%
+  inner_join(subject_metadata, by = c("subject_id" = "Subject_ID")) %>%
+  mutate(Label = factor(Label)) %>%
+  mutate(Health = fct_collapse(Label, Healthy = "Typically Developing", other_level = "ADHD")) %>%
+  mutate(Gender = factor(Gender))
+
+
+d %>% 
+  distinct(Label)
+
+d %>%
+  ggplot() + geom_bar(mapping = aes(x = Label))
+
+```
+
+Now that we've turned it into a tibble, let's take a look at the distribution of connectivity strength and connectivity diversity in healthy and ADHD patients:
+
+```{r}
+
+d %>%
+  pivot_longer(c("connectivity_strength", "connectivity_diversity"), names_to = "connectivity_name", values_to = "connectivity_val") %>%
+  ggplot(aes(x = connectivity_val)) +
+  geom_density(color ="transparent", fill="grey67") + 
+  facet_grid(Health ~ connectivity_name, scales = "free")
+```
+
+How about the connectivity diversity and strength per density? Note that the average for each group is also graphed.
+```{r}
+transform.before.plot <- function(d) {
+  d %>%
+    mutate(density = list(dens.to.eval)) %>%
+    unnest(c("Connectivity Strength Per Density", "Connectivity Diversity Per Density", density)) %>%
+    pivot_longer(c("Connectivity Strength Per Density", "Connectivity Diversity Per Density"), names_to = "connectivity_dcurve_name", values_to = "connectivity_dcurve_val")
+}
+d %>%
+  transform.before.plot() %>%
+  ggplot(aes(x = density, y = connectivity_dcurve_val, color = Label, group = subject_id)) +
+  scale_color_brewer(palette = "Set2") +
+  geom_line(alpha=0.3) +
+  stat_summary(aes(y = connectivity_dcurve_val, group = Label), fun=mean, geom = "line", color = "black") +
+  stat_summary(aes(y = connectivity_dcurve_val, group = Label, fill = Label), fun=mean, geom = "point", size = 3, alpha = 2, shape=21, color="black") +
+  facet_wrap(. ~ connectivity_dcurve_name, scale="free") + 
+  ylab("Connectivity value per density")
+```
+
+Let's also try putting this on a log scale, so that some of that structure at the bottom comes into better focus:
+
+```{r}
+d %>%
+  transform.before.plot() %>%
+  ggplot(aes(x = density, y = connectivity_dcurve_val, color = Label, group = subject_id)) +
+  scale_color_brewer(palette = "Set2") +
+  geom_line(alpha=0.3) +
+  stat_summary(aes(y = connectivity_dcurve_val, group = Label), fun=mean, geom = "line", color = "black") +
+  stat_summary(aes(y = connectivity_dcurve_val, group = Label, fill = Label), fun=mean, geom = "point", size = 3, alpha = 2, shape=21, color="black") +
+  scale_y_continuous(trans='log2')+
+  facet_wrap(. ~ connectivity_dcurve_name, scale="free") + 
+  ylab("Connectivity value per density")
+```
+
+Can also look at 
+Lastly, let's just see what happens if we look at the distribution of diversity/density, without respecting the density at which it occurred:
+```{r}
+d %>%
+  transform.before.plot() %>%
+  ggplot(aes(x = Label, y = connectivity_dcurve_val, fill = Label, group = Label)) +
+  scale_color_brewer(palette = "Set2") +
+  geom_boxplot(alpha=0.7) +
+  geom_jitter(width=.05, alpha=.4) +
+  facet_wrap(. ~ connectivity_dcurve_name, scale="free") + 
+  theme(axis.text.x = element_blank(), axis.title.x = element_blank()) +
+  ylab("Connectivity value per density")
+```
+
+Let's try some nonparametric tests:
+```{r}
+# First we will try the Mann-Whitney U Test
+d %$% wilcox.test(connectivity_strength~Health)
+d %$% wilcox.test(connectivity_diversity~Health)
+
+# Can also use lmPerm to perform a permutation test
+d %$% summary(lmp(connectivity_strength~Health))
+
+# as well as coin
+d %$% oneway_test(connectivity_strength~Health)
+
+d %$% oneway_test(connectivity_strength~Health, distribution=approximate(B=9999))
+
+# let's also try a K-S test
+
+list(x = filter(d, Health == 'Healthy')$connectivity_strength,
+     y = filter(d, Health != 'Healthy')$connectivity_strength) %$%
+  ks.test(x,y)
+
+```
+
+Now let's try using `brms` to fit a model:
+
+```{r}
+fit <-
+  brm(
+    family = Beta,
+    data = d,
+    formula = connectivity_diversity ~ Health
+  )
+print(fit)
+summary(fit)
+# hypothesis(fit, "HealthADHD - Intercept = 0")
+```
+
+### On to visualizations for more of the graph properties
+
+Let's list the rest of the global graph properties we want to visualize and test:
+
+* 
+
+```{r}
+
+```
+
