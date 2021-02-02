@@ -6,8 +6,8 @@ output: html_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
-packages <- c("igraph", "tidyverse", "container")
+knitr::opts_chunk$set(echo = TRUE, fig.width=13, fig.height=13)
+packages <- c("igraph", "tidyverse", "visNetwork", "tidygraph", "parallel")
 lapply(packages, library, character.only = TRUE)
 ```
 
@@ -53,7 +53,7 @@ d <- distances %>%
 
 # Checking each of the coordinates, we can see that we have identical (X,y,z) coordinates for each region, so we'll just pick one at random
 
-d <- distances %>% 
+distances <- distances %>% 
  filter(subject_id=='KKI_2371032') %>%
  full_join(.,., by="subject_id") %>%
  filter(region.x != region.y) %>%
@@ -65,7 +65,7 @@ d <- distances %>%
  # distinct(group, .keep_all = T) %>%
  
 
-d %>%
+distances %>%
   ggplot(aes(x = dist)) +
   geom_histogram(color ="transparent", fill="grey67") +
   xlab('Distance') +
@@ -82,77 +82,250 @@ Now let's get some of those network generation algorithms unpacked.  In particul
 * economical exponential decay
 * economical clustering
 ... and probably some others on top of that as well.
+```{r}
+sampler <- sample(nrow(dist.mat))
+dist.mat[sampler,sampler]
+tic("distance matrix")
+dist.mat <- distances %>%
+  pivot_wider(id_cols = region.x, names_from = region.y, values_from = dist) %>%
+  select(-region.x) %>%
+  as.matrix() %>%
+  .^eta
+toc()
+
+tic()
+sampler <- sample(nrow(dist.mat))
+dist.mat[sampler,sampler]
+toc()
+tic("rest of ops")
+dist.mat <- dist.mat %>%
+  .[,c("region.x", as.character(.$region.x))] %>%
+
+toc()
+```
 
 ```{r}
 # Economical preferential attachment
 
-dist.mat <- d %>%
-  pivot_wider(id_cols = region.x, names_from = region.y, values_from = dist) %>%
-  relocate(BS, .after=region.x) %>%
-  select(-region.x) %>%
-  as.matrix()
-
-diag(dist.mat)
-dist.mat[lower.tri(dist.mat,diag=TRUE)] <- 0
-
 eta <- 5.37
-dist.mat <- dist.mat^eta
+
+dist.mat <- distances %>%
+  pivot_wider(id_cols = region.x, names_from = region.y, values_from = dist) %>%
+  # .[,c("region.x", as.character(.$region.x))] %>%
+  select(-region.x) %>%
+  relocate("BS", .before = "RFP") %>%
+  as.matrix() %>%
+  .^eta
+
+gamma <- 1.81
 
 Nv <- 190
-regions <- d$dist
-names(regions) <- d$group
-dict_regions <- Dict$new(regions)
+array.to.sample.from <- seq(1,Nv,1)
 
-sample_econ_pa <- function() {
-  tic("sampling")
+sample_econ_pa <- function(dist.mat,gamma,Nv) {
   sample_graph <- graph.empty(n = Nv, directed = F)
-  V(sample_graph)$region <- "None"
-  gamma <- 1.81
-  get_distance <- function(existing_node, new_node) {
-    # existing_node <- V(sample_graph)[existing_node_idx]$region
-    # new_node <- V(sample_graph)[new_node_idx]$region
-    dist <- dict_regions$peek(paste(new_node, existing_node, sep = '-'))
+  degrees <- rep(1, Nv)
+  shuffled.idx <- sample(array.to.sample.from,Nv, replace = F, prob = rep(1/Nv,Nv))
+  shuffled.dist.mat <- dist.mat[shuffled.idx,shuffled.idx]
+  V(sample_graph)$region <- colnames(shuffled.dist.mat)
+  calculate_unnormalized_prob <- function(new_node_idx) {
+    p <- (degrees[1:(new_node_idx-1)])^gamma*(shuffled.dist.mat[1:(new_node_idx-1),new_node_idx])
   }
-  normalizing_constant <- function(existing_nodes, new_node) {
-    # print(existing_nodes)
-    # print(new_node_idx)
-    if(!is_empty(existing_nodes)) {
-      tic("distances")
-      dists <- sapply(existing_nodes$region, get_distance, new_node = new_node)
-      toc()
-      tic("degrees")
-      degrees <- sapply(existing_nodes, degree, g = sample_graph) + 1
-      toc()
-      tic("remainder of calculation")
-      probs <- (degrees^gamma)*(dists^eta)
-      p <- sum(probs)
-      toc()
-      p
-    } else {
-      1
+  for(new_node_idx in 2:Nv) {
+    probs <- calculate_unnormalized_prob(new_node_idx)
+    probs <- probs / sum(probs)
+    flips <- rbinom(length(probs),1,probs)
+    if(sum(flips) == 0) {
+      flips[which.max(probs)] = 1
     }
+    to.add <- unlist(lapply(1:length(flips), function(existing_node_idx) {
+      if(flips[existing_node_idx]) {
+        degrees[new_node_idx] = degrees[new_node_idx] + 1
+        degrees[existing_node_idx] = degrees[existing_node_idx] + 1
+        c(new_node_idx, existing_node_idx)
+      }
+    }))
+    sample_graph <- add_edges(sample_graph,to.add)
   }
-  calculate_unnormalized_prob <- function(new_node_idx, existing_nodes) {
-    degrees <- unlist(sapply(existing_nodes, degree, g = sample_graph)) + 1
-    p <- (degrees)^gamma*(dist.mat[1:new_node_idx-1,new_node_idx])
-  }
-  for(new_node_idx in seq_along(colnames(dist.mat))) {
-    new_node <- colnames(dist.mat)[[new_node_idx]]
-    existing_nodes <- V(sample_graph)[1:new_node_idx-1]
-    V(sample_graph)[new_node_idx]$region <- new_node
-    if(!is_empty(existing_nodes)) {
-      probs <- calculate_unnormalized_prob(new_node_idx, existing_nodes)
-      probs <- probs / sum(probs)
-      to.add <- unlist(sapply(1:length(probs), function(existing_node_idx) {
-        if(rbinom(1,1,probs[existing_node_idx])) c(new_node_idx, existing_node_idx)
-      }))
-      sample_graph <- add_edges(sample_graph,to.add)
-    }
-  }
-  toc()
   return(sample_graph)
 }
 
-g <- sample_econ_pa()
+gr <- sample_econ_pa(dist.mat,gamma,Nv)
+
+# tic("sampling")
+# profvis(sample_econ_pa(dist.mat,gamma,Nv))
+# profvis(mean(closeness(gr)))
+# profvis(mean_distance(gr))
+# toc()
+```
+
+```{r, cache=T}
+library(tictoc)
+tic()
+Ng = 1000
+sample_graphs <- lapply(1:Ng, function(i) {
+  sample_econ_pa(dist.mat,gamma,Nv)
+})
+toc()
+```
+
+```{r}
+plot(sample_graphs[[1]], layout=layout.kamada.kawai, vertex.label = V(sample_graphs[[1]])$region)
+
+visIgraph(sample_graphs[[1]])
+
+data <- toVisNetworkData(sample_graphs[[1]])
+visNetwork(nodes = data$nodes, edges = data$edges) %>%
+ visPhysics(solver = "forceAtlas2Based", 
+            forceAtlas2Based = list(gravitationalConstant = -500))
+```
+
+Now let's take a look to how we can differentiate between groups of networks using different graph properties.
+
+We'll start off with the classics.
+
+* average vertex degree
+* average graph distance (or closeness centrality)
+* average vertex connectivity
+* average betweenness centrality
+* assortativity coefficient
+* modularity
+* global efficiency
+* transitivity
+
+10000 total graphs
+
+5000 in group one
+5000 in group two
+
+Divide into 200 subgroups, in each subgroup: 25 from group one, 25 from group two
+Test for difference in means (using t-test (unequal variance), non-parametric, and K-S) in each of the subgroups (between group 1 and group 2) for each above graph property.
+Then power analysis: report the fraction of correct rejections of the null. Additionally,
+report the 'observed' effect size for that fraction, as well as the 'implicit' effect size (how much we changed the parameter(s) in the generative model)
+
+Then look at differences in above graph properties. Based on effect size, make an argument about whether or not you can conclude the groups are different based on the effect size. Does a calculated power
+analysis reach the same conclusion as your simulated power analysis? If not, it's likely the generative model is not correctly tuned. Investigate the difficulty of developing a simulated annealing algorithm for optimizing.
+
+Test for signficance 
+
+```{r}
+library(tictoc)
+tic("Beginning with multicore")
+set.seed(2021)
+graph.properties <- function(group) {
+  analysis <- as.matrix(sapply(group, function(g) {
+    communities <- cluster_walktrap(g)
+    c(
+      mean_degree = mean(degree(g)),
+      mean_distance = mean_distance(g),
+      mean_betweenness = mean(betweenness(g)),
+      transitivity = transitivity(g, type = "global"),
+      assortativity = assortativity_degree(g),
+      modularity = modularity(g,membership(communities))
+    )
+  }))
+}
+effect_sizes = c(0.1, 0.2, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0)
+eta_base = 4.0
+group_size = 2500
+subgroup_size = 25
+
+gamma_base <- 1.5
+gamma.1 <- gamma_base
+Nv <- 190
+
+dist.mat.1 <- distances %>%
+  pivot_wider(id_cols = region.x, names_from = region.y, values_from = dist) %>%
+  select(-region.x) %>%
+  relocate("BS", .before = "RFP") %>%
+  as.matrix() %>%
+  .^eta_base
+group.one <- lapply(1:group_size, function(i) {
+  sample_econ_pa(dist.mat.1,gamma.1,Nv)
+} )
+
+p.vals <- do.call(cbind, flatten(mclapply(effect_sizes, function (effect_size_gamma) {
+  gamma.2 <- gamma_base + effect_size_gamma
+  eta_list <- list(do.call(cbind, flatten(sapply(effect_sizes, function(effect_size_eta) {
+    eta_2 <- eta_base + effect_size
+    
+    dist.mat.2 <- distances %>%
+      pivot_wider(id_cols = region.x, names_from = region.y, values_from = dist) %>%
+      select(-region.x) %>%
+      relocate("BS", .before = "RFP") %>%
+      as.matrix() %>%
+      .^eta_2
+    group.two <- lapply(1:group_size, function(i) {
+      sample_econ_pa(dist.mat.2,gamma.2,Nv)
+    } )
+    idx <- seq(1,group_size,subgroup_size)
+    group.tests <- lapply(idx, function(subgroup.idx) {
+      subgroup.1 <- group.one[subgroup.idx:(subgroup.idx+subgroup_size-1)]
+      subgroup.2 <- group.two[subgroup.idx:(subgroup.idx+subgroup_size-1)]
+      sub1.analyses <- graph.properties(subgroup.1)
+      sub2.analyses <- graph.properties(subgroup.2)
+      rows <- rownames(sub1.analyses)
+      tests <- as.matrix(lapply(1:length(rows), function(i) {
+        wilcox.test(sub1.analyses[i,], sub2.analyses[i,])$p.value
+      }))
+      tests <- rbind(effect_size_eta, effect_size_gamma, tests)
+      rownames(tests) <- c("effect_size_eta", "effect_size_gamma", rows)
+      return(list(tests))
+    })
+  }))))
+}))) %>%
+  t() %>%
+  as_tibble() %>%
+  mutate_all(as.numeric)
+
+significant.vals <- function(pval) {
+  sum(pval < 0.05) / length(pval)
+}
+power <- p.vals %>%
+  group_by(effect_size_eta, effect_size_gamma) %>%
+  summarize_all(list(sig = significant.vals))
+power
+toc()
+# write.csv(power, "power.csv")
+```
+
+```{r}
+gamma <- 1.5
+eta <- 4.0
+
+dist.mat <- distances %>%
+  pivot_wider(id_cols = region.x, names_from = region.y, values_from = dist) %>%
+  select(-region.x) %>%
+  relocate("BS", .before = "RFP") %>%
+  as.matrix() %>%
+  .^eta
+
+g1 <- sample_econ_pa(dist.mat,gamma,Nv)
+data <- toVisNetworkData(g1)
+visNetwork(nodes = data$nodes, edges = data$edges) %>%
+ visPhysics(solver = "forceAtlas2Based", 
+            forceAtlas2Based = list(gravitationalConstant = -500))
+```
+
+```{r}
+gamma <- 1.5 +3.0
+eta <- 4.0 + 3.0
+
+dist.mat <- distances %>%
+  pivot_wider(id_cols = region.x, names_from = region.y, values_from = dist) %>%
+  select(-region.x) %>%
+  relocate("BS", .before = "RFP") %>%
+  as.matrix() %>%
+  .^eta
+
+g2 <- sample_econ_pa(dist.mat,gamma,Nv)
+data <- toVisNetworkData(g2)
+visNetwork(nodes = data$nodes, edges = data$edges) %>%
+ visPhysics(solver = "forceAtlas2Based", 
+            forceAtlas2Based = list(gravitationalConstant = -500))
+```
+
+```{r}
+props <- graph.properties(list(g1,g2))
 ```
 
